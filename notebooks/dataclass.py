@@ -271,13 +271,15 @@ class ToyPANDASDataset(Dataset):
         image = tifffile.imread(os.path.join(self.image_dir, image_file))
         tile = image[tile_i: tile_i + self.tile_size, tile_j: tile_j + self.tile_size, :]
         
+        if self.transform:
+            tile = self.transform(tile)
+        
         if self.norm_func:
             tile = torch.tensor(tile)
             tile = tile.unsqueeze(0).permute(0, 3, 1, 2)
             tile = self.norm_func(tile)
             tile = tile.squeeze(0).permute(1,2,0)
             
-        if self.transform:
-            tile = self.transform(tile)
             
         return tile
+    
