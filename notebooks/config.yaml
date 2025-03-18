@@ -1,0 +1,15 @@
+name: semantic-segmentation-prostate-cancer-biopsy-tissue-deep-learning
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8  
+  - numpy
+  - matplotlib
+  - pytorch
+  - torchvision
+  - pillow
+  - tifffile
+  - pip
+
+  
