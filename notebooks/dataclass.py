@@ -1,6 +1,4 @@
 import os
-import pickle
-import hashlib
 import numpy as np
 import torch
 import tifffile
@@ -210,16 +208,6 @@ class ToyPANDASDataset(Dataset):
         tile_coords = [(int(r * ts), int(c * ts)) for r, c in qualifying]
         return tile_coords
     
-    def _cache_key(self) -> str:
-        """
-        Build a unique hash key from the parameters that affect tile coordinates.
-        If any of these change (different images, tile size, threshold, etc.),
-        the cache is invalidated and tiles are recomputed.
-        """
-        key_str = (f"{self.mask_dir}|{','.join(self.image_files)}|"
-                   f"{self.tile_size}|{self.channel_idx}|{self.min_thresh}")
-        return hashlib.md5(key_str.encode()).hexdigest()
-    
     def get_imtile_coords(self):
         
         """
@@ -228,9 +216,6 @@ class ToyPANDASDataset(Dataset):
         along with coordinates of qualifying tiles in them.
         The image file names can be repeated in tuples, but not
         the coordinate of the tiles.
-        
-        Results are cached to disk so that subsequent instantiations
-        with the same parameters skip the expensive recomputation.
         
         Parameters
         -----------
@@ -245,23 +230,6 @@ class ToyPANDASDataset(Dataset):
             qualifying tiles in the image.
             
         """
-        
-        # Check for a cached result before doing any expensive I/O.
-        # The cache key is a hash of (mask_dir, image files, tile_size, channel_idx, min_thresh),
-        # so changing any parameter triggers a fresh recomputation.
-        cache_dir = os.path.join(self.root_dir, ".tile_cache")
-        cache_file = os.path.join(cache_dir, f"{self._cache_key()}.pkl")
-        
-        if os.path.exists(cache_file):
-            # Cache hit: load pre-computed coords and stats, skip all mask reads
-            print("Loading cached tile coordinates...")
-            with open(cache_file, "rb") as f:
-                cached = pickle.load(f)
-            self.n_tiles_processed = cached["n_tiles_processed"]
-            self.n_qualifying_tiles = cached["n_qualifying_tiles"]
-            self.tile_qualifying_ratio = self.n_qualifying_tiles / self.n_tiles_processed
-            print(f"Loaded {len(cached['imtile_coords'])} tile coordinates from cache.")
-            return cached["imtile_coords"]
         
         imtile_coords = []
         
@@ -283,21 +251,7 @@ class ToyPANDASDataset(Dataset):
         assert imfiles == set(self.image_files)
         # Verify all tile coordinates are multiples of tile_size,
         # confirming they sit on a valid non-overlapping grid.
-        # Unlike the previous consecutive-difference check, this does not
-        # assume full grid coverage (which can fail with sparse qualifying tiles).
         assert all(t[1] % self.tile_size == 0 and t[2] % self.tile_size == 0 for t in imtile_coords)
-        
-        # Cache the results (coords + stats) to disk as a pickle file,
-        # so that subsequent instantiations with the same parameters
-        # skip all mask reads and tile computation entirely.
-        os.makedirs(cache_dir, exist_ok=True)
-        with open(cache_file, "wb") as f:
-            pickle.dump({
-                "imtile_coords": imtile_coords,
-                "n_tiles_processed": self.n_tiles_processed,
-                "n_qualifying_tiles": self.n_qualifying_tiles,
-            }, f)
-        print(f"Cached tile coordinates to {cache_file}")
             
         return imtile_coords
         
