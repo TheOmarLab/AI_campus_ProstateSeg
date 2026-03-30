@@ -1,4 +1,6 @@
 import os
+import pickle
+import hashlib
 import numpy as np
 import torch
 import tifffile
@@ -82,8 +84,8 @@ class ToyPANDASDataset(Dataset):
         self.tile_size = tile_size
         self.full_mask_ext = self.mask_suffix + self.maskfile_ext
         self.channel_idx = channel_idx
-        self.image_files = list(filter(lambda file: file != '.DS_Store', sorted(os.listdir(self.image_dir))))
-        self.mask_files = list(filter(lambda file: file != '.DS_Store', sorted(os.listdir(self.mask_dir))))
+        self.image_files = list(filter(lambda file: file != '.DS_Store' and file != '.ipynb_checkpoints', sorted(os.listdir(self.image_dir))))
+        self.mask_files = list(filter(lambda file: file != '.DS_Store' and file != '.ipynb_checkpoints', sorted(os.listdir(self.mask_dir))))
         self.n_tiles_processed = 0
         self.n_qualifying_tiles = 0
         self.min_thresh = min_thresh
@@ -111,10 +113,12 @@ class ToyPANDASDataset(Dataset):
         The filename up until but excluding the extension
         
         """
-        i = 1
-        while filename[-i:] != ext:
-            i += 1
-        return filename[0:len(filename)-i]
+        # Use rfind to locate the extension from the right end of the string,
+        # avoiding the original while-loop approach for clarity and speed
+        idx = filename.rfind(ext)
+        if idx == -1:
+            raise ValueError(f"Extension '{ext}' not found in filename '{filename}'")
+        return filename[:idx]
     
     def tile_qualifier(self,
                        tile_mask: np.ndarray):
@@ -175,22 +179,46 @@ class ToyPANDASDataset(Dataset):
             to the tile qualifier function. 
         """
         
+        # Extract just the relevant channel from the multi-channel mask
         mask = mask[:,:,self.channel_idx]
         assert len(mask.shape) == 2
         R, C = mask.shape
-        tile_coords = []
-        for i in range(0, R, self.tile_size):
-            for j in range(0, C, self.tile_size):
-                try:
-                    tile = mask[i : i + self.tile_size, j : j + self.tile_size]
-                    self.n_tiles_processed += 1
-                    if tile.shape == (self.tile_size, self.tile_size) and self.tile_qualifier(tile):
-                        tile_coords.append((i, j))
-                        self.n_qualifying_tiles += 1
-                except IndexError:
-                    print(f"Skipping tile at position ({i}, {j}) because it is out of bounds.")
-                        
+        ts = self.tile_size
+        
+        # Trim mask to dimensions evenly divisible by tile_size.
+        # This discards partial edge tiles that don't form a full (ts x ts) square,
+        # equivalent to the original shape check: tile.shape == (tile_size, tile_size)
+        n_rows = R // ts
+        n_cols = C // ts
+        mask_trimmed = mask[:n_rows * ts, :n_cols * ts]
+        
+        total_tiles = n_rows * n_cols
+        self.n_tiles_processed += total_tiles
+        
+        # Vectorized tile qualification (replaces nested Python for-loops):
+        # Reshape the 2D mask into a 4D grid of (n_rows, ts, n_cols, ts),
+        # where each (ts x ts) block is one tile. Then compute the signal
+        # ratio for all tiles at once by summing along the tile dimensions (1, 3).
+        tiles = mask_trimmed.reshape(n_rows, ts, n_cols, ts)
+        signal_ratios = (tiles > 0).sum(axis=(1, 3)) / (ts * ts)
+        
+        # argwhere returns (row_idx, col_idx) of tiles exceeding min_thresh.
+        # Multiply by ts to convert grid indices back to pixel coordinates.
+        qualifying = np.argwhere(signal_ratios >= self.min_thresh)
+        self.n_qualifying_tiles += len(qualifying)
+        
+        tile_coords = [(int(r * ts), int(c * ts)) for r, c in qualifying]
         return tile_coords
+    
+    def _cache_key(self) -> str:
+        """
+        Build a unique hash key from the parameters that affect tile coordinates.
+        If any of these change (different images, tile size, threshold, etc.),
+        the cache is invalidated and tiles are recomputed.
+        """
+        key_str = (f"{self.mask_dir}|{','.join(self.image_files)}|"
+                   f"{self.tile_size}|{self.channel_idx}|{self.min_thresh}")
+        return hashlib.md5(key_str.encode()).hexdigest()
     
     def get_imtile_coords(self):
         
@@ -200,6 +228,9 @@ class ToyPANDASDataset(Dataset):
         along with coordinates of qualifying tiles in them.
         The image file names can be repeated in tuples, but not
         the coordinate of the tiles.
+        
+        Results are cached to disk so that subsequent instantiations
+        with the same parameters skip the expensive recomputation.
         
         Parameters
         -----------
@@ -214,6 +245,23 @@ class ToyPANDASDataset(Dataset):
             qualifying tiles in the image.
             
         """
+        
+        # Check for a cached result before doing any expensive I/O.
+        # The cache key is a hash of (mask_dir, image files, tile_size, channel_idx, min_thresh),
+        # so changing any parameter triggers a fresh recomputation.
+        cache_dir = os.path.join(self.root_dir, ".tile_cache")
+        cache_file = os.path.join(cache_dir, f"{self._cache_key()}.pkl")
+        
+        if os.path.exists(cache_file):
+            # Cache hit: load pre-computed coords and stats, skip all mask reads
+            print("Loading cached tile coordinates...")
+            with open(cache_file, "rb") as f:
+                cached = pickle.load(f)
+            self.n_tiles_processed = cached["n_tiles_processed"]
+            self.n_qualifying_tiles = cached["n_qualifying_tiles"]
+            self.tile_qualifying_ratio = self.n_qualifying_tiles / self.n_tiles_processed
+            print(f"Loaded {len(cached['imtile_coords'])} tile coordinates from cache.")
+            return cached["imtile_coords"]
         
         imtile_coords = []
         
@@ -233,14 +281,23 @@ class ToyPANDASDataset(Dataset):
         
         imfiles = set([t[0] for t in imtile_coords])
         assert imfiles == set(self.image_files)
-        i_vals = sorted(list(set([t[1] for t in imtile_coords])))
-        j_vals = sorted(list(set([t[2] for t in imtile_coords])))
+        # Verify all tile coordinates are multiples of tile_size,
+        # confirming they sit on a valid non-overlapping grid.
+        # Unlike the previous consecutive-difference check, this does not
+        # assume full grid coverage (which can fail with sparse qualifying tiles).
+        assert all(t[1] % self.tile_size == 0 and t[2] % self.tile_size == 0 for t in imtile_coords)
         
-        for i in range(len(i_vals)-1):
-            assert i_vals[i + 1] - i_vals[i] == self.tile_size
-        
-        for j in range(len(j_vals)-1):
-            assert j_vals[j + 1] - j_vals[j] == self.tile_size
+        # Cache the results (coords + stats) to disk as a pickle file,
+        # so that subsequent instantiations with the same parameters
+        # skip all mask reads and tile computation entirely.
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_file, "wb") as f:
+            pickle.dump({
+                "imtile_coords": imtile_coords,
+                "n_tiles_processed": self.n_tiles_processed,
+                "n_qualifying_tiles": self.n_qualifying_tiles,
+            }, f)
+        print(f"Cached tile coordinates to {cache_file}")
             
         return imtile_coords
         
